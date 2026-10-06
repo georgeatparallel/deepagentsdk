@@ -2,6 +2,26 @@ import { expect, test } from "bun:test";
 import { MockLanguageModelV3 } from "ai/test";
 import { runParallelResearch } from "../examples/parallel-search";
 
+type SourceResult = { url: string; excerpts: string[] };
+function findSearchResults(value: unknown): SourceResult[] | undefined {
+  if (typeof value === "string") {
+    try { return findSearchResults(JSON.parse(value)); } catch { return undefined; }
+  }
+  if (value && typeof value === "object") {
+    const record = value as Record<string, unknown>;
+    if (Array.isArray(record.results)) {
+      return record.results.filter((item): item is SourceResult =>
+        item !== null && typeof item === "object" && typeof item.url === "string" &&
+        Array.isArray(item.excerpts) && item.excerpts.every((excerpt: unknown) => typeof excerpt === "string"));
+    }
+    for (const child of Object.values(record)) {
+      const results = findSearchResults(child);
+      if (results) return results;
+    }
+  }
+  return undefined;
+}
+
 function findExcerpt(value: unknown): string | undefined {
   if (typeof value === "string") {
     try { return findExcerpt(JSON.parse(value)); } catch { return undefined; }
@@ -47,11 +67,25 @@ test("anonymous HTTP MCP search and fetch return a grounded DeepAgent answer", a
     outputTokens: { total: 1, text: 1, reasoning: 0 },
   };
   let step = 0;
+  let sourceUrl = "";
+  let searchResultCount = 0;
   const model = new MockLanguageModelV3({
     doGenerate: async (params) => {
       expect(params.tools?.map((tool) => tool.name)).toContain("parallel_web_search");
       expect(params.tools?.map((tool) => tool.name)).toContain("parallel_web_fetch");
       expect(params.tools?.map((tool) => tool.name)).not.toContain("web_search");
+      if (step === 1) {
+        const searchMessage = params.prompt.filter((message) => message.role === "tool").at(-1);
+        expect(JSON.stringify(searchMessage)).not.toContain('"isError":true');
+        const searchResults = findSearchResults(searchMessage);
+        expect(searchResults?.length).toBeGreaterThan(0);
+        searchResultCount = searchResults?.length || 0;
+        const source = searchResults?.find((result) =>
+          new URL(result.url).hostname === "modelcontextprotocol.io" &&
+          result.url.includes("intro") && result.excerpts.join(" ").includes("Model Context Protocol"));
+        if (!source) throw new Error("Search returned no sourced official MCP introduction.");
+        sourceUrl = source.url;
+      }
       if (step < 2) {
         const search = step++ === 0;
         return {
@@ -64,7 +98,7 @@ test("anonymous HTTP MCP search and fetch return a grounded DeepAgent answer", a
               search_queries: ["Model Context Protocol official introduction"],
               session_id: sessionId,
             } : {
-              urls: ["https://modelcontextprotocol.io/introduction"],
+              urls: [sourceUrl],
               objective: "What does the Model Context Protocol do?",
               session_id: sessionId,
             }),
@@ -83,7 +117,7 @@ test("anonymous HTTP MCP search and fetch return a grounded DeepAgent answer", a
       const definition = excerpt?.split("\n").find((line) => line.includes("open-source standard"));
       expect(definition).toBeDefined();
       return {
-        content: [{ type: "text" as const, text: `${definition}\nSource: https://modelcontextprotocol.io/introduction` }],
+        content: [{ type: "text" as const, text: `${definition}\nSource: ${sourceUrl}` }],
         finishReason: { unified: "stop" as const, raw: undefined }, usage, warnings: [],
       };
     },
@@ -97,7 +131,7 @@ test("anonymous HTTP MCP search and fetch return a grounded DeepAgent answer", a
       expect(request.authorization).toBe(false);
       expect(request.userAgent).toStartWith("deepagentsdk/parallel-search-example");
     }
-    console.log(JSON.stringify({ requests: observed, answer: result.text }));
+    console.log(JSON.stringify({ requests: observed, searchResultCount, sourceUrl, answer: result.text }));
   } finally {
     globalThis.fetch = originalFetch;
     keys.forEach((key, i) => {
